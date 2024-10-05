@@ -549,7 +549,9 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFileMixin):
         callback_on_step_end: Optional[Callable[[int, int, Dict], None]] = None,
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         max_sequence_length: int = 512,
-        guidance_mode = None, #one of cfg, cfgpp, seg, apg
+        compile=False,
+        debug=False,
+        guidance_mode = None, #one of cfg, cfgpp, seg, apg, apg-sample
         guidance_weight = 0.0
     ):
         r"""
@@ -621,7 +623,7 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFileMixin):
             is True, otherwise a `tuple`. When returning a tuple, the first element is a list with the generated
             images.
         """
-
+        self._debug = debug
         height = height or self.default_sample_size * self.vae_scale_factor
         width = width or self.default_sample_size * self.vae_scale_factor
 
@@ -710,6 +712,7 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFileMixin):
         else:
             guidance = None
 
+        momentum_buffer = MomentumBuffer(momentum=0.1) if guidance_mode == 'apg' else None
         # 6. Denoising loop
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
@@ -720,11 +723,18 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFileMixin):
                     latent_model_input = torch.cat([latents] * 2)
                 else:
                     latent_model_input = latents
+
+                self.debug_msg(f'latents shape {latent_model_input.shape}, txt_ids, {text_ids.shape}, img_ids {latent_image_ids.shape}, guidance {guidance.shape} timesteps {timesteps.shape}, prompt_embeds {prompt_embeds.shape}, pooled {pooled_prompt_embeds.shape}')
                     
                 # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
                 timestep = t.expand(latents.shape[0]).to(latents.dtype)
+
+                if compile:
+                    compiled_transformer = torch.compile(self.transformer, dynamic=True, mode="max-autotune")
+                else:
+                    compiled_transformer = self.transformer
     
-                noise_pred = self.transformer(
+                noise_pred = compiled_transformer(
                     hidden_states=latent_model_input,
                     timestep=timestep / 1000,
                     guidance=guidance,
@@ -735,7 +745,7 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFileMixin):
                     joint_attention_kwargs=self.joint_attention_kwargs,
                     return_dict=False,
                 )[0]
-
+                self.debug_msg(f'guidance_mode is {guidance_mode}. noise_pred shape is {noise_pred.shape}')
                 if guidance_mode == 'cfg':
                     #guidance_weight E [3.5, Inf]
                     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
@@ -745,10 +755,11 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFileMixin):
                     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                     noise_pred = noise_pred_uncond + self.guidance_weight * (noise_pred_text - noise_pred_uncond)
                 elif guidance_mode == 'seg':
+                    ##Switch the attention processor & use the base transfomer. compiled transformer will use old mechanism. But this should be before the 
                     pass
                 elif guidance_mode == 'apg':
                     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                    noise_pred = apg_normalized_guidance()
+                    noise_pred = apg_normalized_guidance(noise_pred_text, noise_pred_uncond, self.guidance_weight, momentum_buffer, eta=1.0, norm_threshold=0.0)
 
                 # compute the previous noisy sample x_t -> x_t-1
                 latents_dtype = latents.dtype
@@ -791,3 +802,7 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFileMixin):
             return (image,)
 
         return FluxPipelineOutput(images=image)
+
+    def debug_msg(self, msg):
+        if self._debug:
+            print(msg)

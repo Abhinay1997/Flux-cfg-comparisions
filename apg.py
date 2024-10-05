@@ -1,3 +1,5 @@
+import torch
+
 class MomentumBuffer:
     def __init__(self, momentum: float):
         self.momentum = momentum
