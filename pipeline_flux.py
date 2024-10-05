@@ -290,6 +290,7 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFileMixin):
         self,
         prompt: Union[str, List[str]],
         prompt_2: Union[str, List[str]],
+        negative_prompt = None,
         device: Optional[torch.device] = None,
         num_images_per_prompt: int = 1,
         prompt_embeds: Optional[torch.FloatTensor] = None,
@@ -351,13 +352,17 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFileMixin):
                 device=device,
             )
             if do_classifier_free_guidance:
+                if negative_prompt == None:
+                    negative_prompt = ['']
+                elif isinstance(negative_prompt, str):
+                    negative_prompt = [negative_prompt]
                 uncond_pooled_prompt_embeds = self._get_clip_prompt_embeds(
-                    prompt=[''],
+                    prompt=negative_prompt,
                     device=device,
                     num_images_per_prompt=num_images_per_prompt,
                 )
                 uncond_prompt_embeds = self._get_t5_prompt_embeds(
-                    prompt=prompt_2,
+                    prompt=negative_prompt,
                     num_images_per_prompt=num_images_per_prompt,
                     max_sequence_length=max_sequence_length,
                     device=device,
@@ -548,6 +553,7 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFileMixin):
         self,
         prompt: Union[str, List[str]] = None,
         prompt_2: Optional[Union[str, List[str]]] = None,
+        negative_prompt: Union[str, List[str]] = None,
         height: Optional[int] = None,
         width: Optional[int] = None,
         num_inference_steps: int = 28,
