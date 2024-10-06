@@ -395,7 +395,13 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFileMixin):
         pooled_prompt_embeds=None,
         callback_on_step_end_tensor_inputs=None,
         max_sequence_length=None,
-    ):
+        guidance_mode=None
+    ):  
+        if guidance_mode is not None:
+            if guidance_mode not in ['cfg', 'apg', 'cfgpp', 'seg', 'apg-sample']:
+                raise ValueError(
+                f"guidance_mode should be one of ['cfg', 'apg', 'cfgpp', 'seg', 'apg-sample'] but got {guidance_mode}"
+            )
         if height % 8 != 0 or width % 8 != 0:
             raise ValueError(f"`height` and `width` have to be divisible by 8 but are {height} and {width}.")
 
@@ -432,6 +438,7 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFileMixin):
 
         if max_sequence_length is not None and max_sequence_length > 512:
             raise ValueError(f"`max_sequence_length` cannot be greater than 512 but is {max_sequence_length}")
+
 
     @staticmethod
     def _prepare_latent_image_ids(batch_size, height, width, device, dtype):
@@ -661,6 +668,7 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFileMixin):
             pooled_prompt_embeds=pooled_prompt_embeds,
             callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
             max_sequence_length=max_sequence_length,
+            guidance_mode=guidance_mode
         )
 
         self._guidance_scale = guidance_scale
@@ -744,12 +752,12 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFileMixin):
                 if self.interrupt:
                     continue
 
-                if guidance_mode in ['cfg', 'cfgpp']:
+                if guidance_mode in ['cfg', 'cfgpp', 'apg']:
                     latent_model_input = torch.cat([latents] * 2)
                 else:
                     latent_model_input = latents
 
-                self.debug_msg(f'latents shape {latent_model_input.shape}, txt_ids, {text_ids.shape}, img_ids {latent_image_ids.shape}, guidance {guidance.shape} timesteps {timesteps.shape}, prompt_embeds {prompt_embeds.shape}, pooled {pooled_prompt_embeds.shape}')
+                self.debug_msg(f'latents shape {latent_model_input.shape}, txt_ids, {text_ids.shape}, img_ids {latent_image_ids.shape} timesteps {timesteps.shape}, prompt_embeds {prompt_embeds.shape}, pooled {pooled_prompt_embeds.shape}')
                     
                 # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
                 timestep = t.expand(latents.shape[0]).to(latents.dtype)
@@ -784,6 +792,7 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFileMixin):
                     pass
                 elif guidance_mode == 'apg':
                     noise_pred_text, noise_pred_uncond = noise_pred.chunk(2)
+                    self.debug_msg(f'apg shape {noise_pred.shape}, {noise_pred_text.shape}')
                     noise_pred = apg_normalized_guidance(noise_pred_text, noise_pred_uncond, guidance_weight, momentum_buffer, eta=apg_eta, norm_threshold=apg_r)
 
                 # compute the previous noisy sample x_t -> x_t-1
