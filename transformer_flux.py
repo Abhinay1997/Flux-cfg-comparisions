@@ -35,16 +35,35 @@ from diffusers.utils import USE_PEFT_BACKEND, is_torch_version, logging, scale_l
 from diffusers.utils.torch_utils import maybe_allow_in_graph
 from diffusers.models.embeddings import CombinedTimestepGuidanceTextProjEmbeddings, CombinedTimestepTextProjEmbeddings, FluxPosEmbed
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
+import math
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
+def gaussian_blur_2d(img, kernel_size, sigma):
+    height = img.shape[-1]
+    kernel_size = min(kernel_size, height - (height % 2 - 1))
+    ksize_half = (kernel_size - 1) * 0.5
+
+    x = torch.linspace(-ksize_half, ksize_half, steps=kernel_size)
+
+    pdf = torch.exp(-0.5 * (x / sigma).pow(2))
+
+    x_kernel = pdf / pdf.sum()
+    x_kernel = x_kernel.to(device=img.device, dtype=img.dtype)
+
+    kernel2d = torch.mm(x_kernel[:, None], x_kernel[None, :])
+    kernel2d = kernel2d.expand(img.shape[-3], 1, kernel2d.shape[0], kernel2d.shape[1])
+
+    padding = [kernel_size // 2, kernel_size // 2, kernel_size // 2, kernel_size // 2]
+
+    img = F.pad(img, padding, mode="reflect")
+    img = F.conv2d(img, kernel2d, groups=img.shape[-3])
+
+    return img
+
 class CustomFluxAttnProcessor2_0:
     """Attention processor used typically in processing the SD3-like self-attention projections."""
-
-    def __init__(self):
-        if not hasattr(F, "scaled_dot_product_attention"):
-            raise ImportError("FluxAttnProcessor2_0 requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0.")
 
     def __call__(
         self,
@@ -53,9 +72,13 @@ class CustomFluxAttnProcessor2_0:
         encoder_hidden_states: torch.FloatTensor = None,
         attention_mask: Optional[torch.FloatTensor] = None,
         image_rotary_emb: Optional[torch.Tensor] = None,
+        seg_blur_sigma=1.0,
+        guidance_mode=None,
+        seg_inf_blur_threshold=9999.0,
     ) -> torch.FloatTensor:
         batch_size, _, _ = hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
 
+        print('guidance_mode, seg params', guidance_mode, seg_blur_sigma, seg_inf_blur_threshold)
         print('hidden states', hidden_states.shape)
         # `sample` projections.
         query = attn.to_q(hidden_states)
@@ -65,18 +88,32 @@ class CustomFluxAttnProcessor2_0:
         inner_dim = key.shape[-1]
         head_dim = inner_dim // attn.heads
         
-        print('query, key, value after proj', query.shape, key.shape, value.shape)
-        
         query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
         key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
         value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
 
+        ## TODO: chunk into 2 or 3 parts depending on just seg or cfg+seg
+        if guidance_mode == "seg":
+            height = width = math.isqrt(query.shape[2])
+            query_org, query_ptb = query.chunk(2)
+            ##reshape query_ptb and apply 2d gaussian kernel
+            query_ptb = query_ptb.permute(0, 1, 3, 2).view(batch_size//2, attn.heads * head_dim, height, width)
+            
+            if not (seg_blur_sigma > seg_inf_blur_threshold):
+                kernel_size = math.ceil(6 * seg_blur_sigma) + 1 - math.ceil(6 * seg_blur_sigma) % 2
+                query_ptb = gaussian_blur_2d(query_ptb, kernel_size, seg_blur_sigma)
+            else:
+                print('inf threshold shape', query_ptb.mean(dim=(-2, -1), keepdim=True).shape)
+                query_ptb[:] = query_ptb.mean(dim=(-2, -1), keepdim=True)
+
+            query_ptb = query_ptb.view(batch_size//2, attn.heads, head_dim, height*width).permute(0,1,3,2)
+            query = torch.cat((query_org, query_ptb), dim=0)
+            
         if attn.norm_q is not None:
             query = attn.norm_q(query)
         if attn.norm_k is not None:
             key = attn.norm_k(key)
 
-        print('query, key, value after proj & reshape', query.shape, key.shape, value.shape)
         # the attention in FluxSingleTransformerBlock does not use `encoder_hidden_states`
         if encoder_hidden_states is not None:
             # `context` projections.
@@ -84,7 +121,6 @@ class CustomFluxAttnProcessor2_0:
             encoder_hidden_states_key_proj = attn.add_k_proj(encoder_hidden_states)
             encoder_hidden_states_value_proj = attn.add_v_proj(encoder_hidden_states)
 
-            print('encoder query, key, value after proj', encoder_hidden_states_query_proj.shape, encoder_hidden_states_key_proj.shape, encoder_hidden_states_value_proj.shape)
             encoder_hidden_states_query_proj = encoder_hidden_states_query_proj.view(
                 batch_size, -1, attn.heads, head_dim
             ).transpose(1, 2)
@@ -95,12 +131,28 @@ class CustomFluxAttnProcessor2_0:
                 batch_size, -1, attn.heads, head_dim
             ).transpose(1, 2)
 
-            print('encoder query, key, value after proj & reshape', encoder_hidden_states_query_proj.shape, encoder_hidden_states_key_proj.shape, encoder_hidden_states_value_proj.shape)
-
             if attn.norm_added_q is not None:
                 encoder_hidden_states_query_proj = attn.norm_added_q(encoder_hidden_states_query_proj)
             if attn.norm_added_k is not None:
                 encoder_hidden_states_key_proj = attn.norm_added_k(encoder_hidden_states_key_proj)
+
+            if guidance_mode == "seg":
+                height = 32
+                width = 16
+                encoder_query_orig, encoder_query_ptb = encoder_hidden_states_query_proj.chunk(2)
+                print('E query_ptb shape', encoder_query_ptb.shape)
+                ##reshape query_ptb and apply 2d gaussian kernel
+                encoder_query_ptb = encoder_query_ptb.permute(0, 1, 3, 2).view(batch_size//2, attn.heads * head_dim, height, width)
+                print('E query_ptb shape after reshape', encoder_query_ptb.shape)
+                if not (seg_blur_sigma > seg_inf_blur_threshold):
+                    kernel_size = math.ceil(6 * seg_blur_sigma) + 1 - math.ceil(6 * seg_blur_sigma) % 2
+                    encoder_query_ptb = gaussian_blur_2d(encoder_query_ptb, kernel_size, seg_blur_sigma)
+                else:
+                    print('inf threshold shape', encoder_query_ptb.mean(dim=(-2, -1), keepdim=True).shape)
+                    encoder_query_ptb[:] = encoder_query_ptb.mean(dim=(-2, -1), keepdim=True)
+                print('E query_ptb shape after op', encoder_query_ptb.shape)
+                encoder_query_ptb = encoder_query_ptb.view(batch_size//2, attn.heads, head_dim, height*width).permute(0,1,3,2)
+                encoder_hidden_states_query_proj = torch.cat((encoder_query_orig, encoder_query_ptb), dim=0)
 
             # attention
             query = torch.cat([encoder_hidden_states_query_proj, query], dim=2)
@@ -254,6 +306,7 @@ class FluxTransformerBlock(nn.Module):
         encoder_hidden_states: torch.FloatTensor,
         temb: torch.FloatTensor,
         image_rotary_emb=None,
+        joint_attention_kwargs=None
     ):
         norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm1(hidden_states, emb=temb)
 
@@ -266,6 +319,7 @@ class FluxTransformerBlock(nn.Module):
             hidden_states=norm_hidden_states,
             encoder_hidden_states=norm_encoder_hidden_states,
             image_rotary_emb=image_rotary_emb,
+            **joint_attention_kwargs
         )
 
         # Process attention outputs for the `hidden_states`.
@@ -590,6 +644,7 @@ class FluxTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrig
                     encoder_hidden_states=encoder_hidden_states,
                     temb=temb,
                     image_rotary_emb=image_rotary_emb,
+                    joint_attention_kwargs=joint_attention_kwargs
                 )
 
             # controlnet residual

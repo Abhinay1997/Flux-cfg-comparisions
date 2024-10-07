@@ -573,7 +573,7 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFileMixin):
         pooled_prompt_embeds: Optional[torch.FloatTensor] = None,
         output_type: Optional[str] = "pil",
         return_dict: bool = True,
-        joint_attention_kwargs: Optional[Dict[str, Any]] = None,
+        joint_attention_kwargs: Optional[Dict[str, Any]] = {},
         callback_on_step_end: Optional[Callable[[int, int, Dict], None]] = None,
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         max_sequence_length: int = 512,
@@ -583,7 +583,10 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFileMixin):
         guidance_weight = 0.0,
         apg_eta = 0.0,
         apg_momentum = -0.75,
-        apg_r = 2.5
+        apg_r = 2.5,
+        seg_blur_sigma = 1.0,
+        seg_inf_blur_threshold = 9999.0,
+        seg_guidance_weight = None
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -746,13 +749,16 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFileMixin):
             guidance = None
 
         momentum_buffer = MomentumBuffer(momentum=apg_momentum) if guidance_mode == 'apg' else None
+        self.joint_attention_kwargs['guidance_mode'] = guidance_mode
+        self.joint_attention_kwargs['seg_blur_sigma'] = seg_blur_sigma
+        self.joint_attention_kwargs['seg_inf_blur_threshold'] = seg_inf_blur_threshold
         # 6. Denoising loop
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 if self.interrupt:
                     continue
 
-                if guidance_mode in ['cfg', 'cfgpp', 'apg']:
+                if guidance_mode in ['cfg', 'cfgpp', 'apg', 'seg']:
                     latent_model_input = torch.cat([latents] * 2)
                 else:
                     latent_model_input = latents
@@ -788,8 +794,8 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFileMixin):
                     noise_pred_text, noise_pred_uncond = noise_pred.chunk(2)
                     noise_pred = noise_pred_uncond + guidance_weight * (noise_pred_text - noise_pred_uncond)
                 elif guidance_mode == 'seg':
-                    ##Switch the attention processor & use the base transfomer. compiled transformer will use old mechanism. But this should be before the 
-                    pass
+                    noise_pred_text, noise_pred_uncond_ptb = noise_pred.chunk(2)
+                    noise_pred = noise_pred_uncond_ptb + seg_guidance_weight * (noise_pred_text - noise_pred_uncond_ptb)
                 elif guidance_mode == 'apg':
                     noise_pred_text, noise_pred_uncond = noise_pred.chunk(2)
                     self.debug_msg(f'apg shape {noise_pred.shape}, {noise_pred_text.shape}')
