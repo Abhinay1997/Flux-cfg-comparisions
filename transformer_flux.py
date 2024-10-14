@@ -78,8 +78,8 @@ class CustomFluxAttnProcessor2_0:
     ) -> torch.FloatTensor:
         batch_size, _, _ = hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
 
-        print('guidance_mode, seg params', guidance_mode, seg_blur_sigma, seg_inf_blur_threshold)
-        print('hidden states', hidden_states.shape)
+        # print('guidance_mode, seg params', guidance_mode, seg_blur_sigma, seg_inf_blur_threshold)
+        # print('hidden states', hidden_states.shape)
         # `sample` projections.
         query = attn.to_q(hidden_states)
         key = attn.to_k(hidden_states)
@@ -96,7 +96,6 @@ class CustomFluxAttnProcessor2_0:
         if guidance_mode == "seg":
             height = width = math.isqrt(query.shape[2])
             query_org, query_ptb = query.chunk(2)
-            ##reshape query_ptb and apply 2d gaussian kernel
             query_ptb = query_ptb.permute(0, 1, 3, 2).view(batch_size//2, attn.heads * head_dim, height, width)
             
             if not (seg_blur_sigma > seg_inf_blur_threshold):
@@ -108,6 +107,22 @@ class CustomFluxAttnProcessor2_0:
 
             query_ptb = query_ptb.view(batch_size//2, attn.heads, head_dim, height*width).permute(0,1,3,2)
             query = torch.cat((query_org, query_ptb), dim=0)
+
+        if guidance_mode == "cfg+seg":
+            height = width = math.isqrt(query.shape[2])
+            query_org, query_ptb, query_uncond = query.chunk(3)
+            query_ptb = query_ptb.permute(0, 1, 3, 2).view(batch_size//3, attn.heads * head_dim, height, width)
+            
+            if not (seg_blur_sigma > seg_inf_blur_threshold):
+                kernel_size = math.ceil(6 * seg_blur_sigma) + 1 - math.ceil(6 * seg_blur_sigma) % 2
+                query_ptb = gaussian_blur_2d(query_ptb, kernel_size, seg_blur_sigma)
+            else:
+                print('inf threshold shape', query_ptb.mean(dim=(-2, -1), keepdim=True).shape)
+                query_ptb[:] = query_ptb.mean(dim=(-2, -1), keepdim=True)
+
+            query_ptb = query_ptb.view(batch_size//3, attn.heads, head_dim, height*width).permute(0,1,3,2)
+            query = torch.cat((query_org, query_ptb, query_uncond), dim=0)
+            
             
         if attn.norm_q is not None:
             query = attn.norm_q(query)
@@ -135,24 +150,6 @@ class CustomFluxAttnProcessor2_0:
                 encoder_hidden_states_query_proj = attn.norm_added_q(encoder_hidden_states_query_proj)
             if attn.norm_added_k is not None:
                 encoder_hidden_states_key_proj = attn.norm_added_k(encoder_hidden_states_key_proj)
-
-            if guidance_mode == "seg":
-                height = 32
-                width = 16
-                encoder_query_orig, encoder_query_ptb = encoder_hidden_states_query_proj.chunk(2)
-                print('E query_ptb shape', encoder_query_ptb.shape)
-                ##reshape query_ptb and apply 2d gaussian kernel
-                encoder_query_ptb = encoder_query_ptb.permute(0, 1, 3, 2).view(batch_size//2, attn.heads * head_dim, height, width)
-                print('E query_ptb shape after reshape', encoder_query_ptb.shape)
-                if not (seg_blur_sigma > seg_inf_blur_threshold):
-                    kernel_size = math.ceil(6 * seg_blur_sigma) + 1 - math.ceil(6 * seg_blur_sigma) % 2
-                    encoder_query_ptb = gaussian_blur_2d(encoder_query_ptb, kernel_size, seg_blur_sigma)
-                else:
-                    print('inf threshold shape', encoder_query_ptb.mean(dim=(-2, -1), keepdim=True).shape)
-                    encoder_query_ptb[:] = encoder_query_ptb.mean(dim=(-2, -1), keepdim=True)
-                print('E query_ptb shape after op', encoder_query_ptb.shape)
-                encoder_query_ptb = encoder_query_ptb.view(batch_size//2, attn.heads, head_dim, height*width).permute(0,1,3,2)
-                encoder_hidden_states_query_proj = torch.cat((encoder_query_orig, encoder_query_ptb), dim=0)
 
             # attention
             query = torch.cat([encoder_hidden_states_query_proj, query], dim=2)

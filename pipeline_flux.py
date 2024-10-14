@@ -297,7 +297,8 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFileMixin):
         pooled_prompt_embeds: Optional[torch.FloatTensor] = None,
         max_sequence_length: int = 512,
         lora_scale: Optional[float] = None,
-        do_classifier_free_guidance=False
+        do_classifier_free_guidance=False,
+        guidance_mode=None
     ):
         r"""
 
@@ -351,7 +352,14 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFileMixin):
                 max_sequence_length=max_sequence_length,
                 device=device,
             )
-            if do_classifier_free_guidance:
+            #seg => [text, text]
+            #cfg+seg => [text, text, null]
+            #cfg => [text, null]
+            if guidance_mode in ['seg', 'cfg+seg']:
+                prompt_embeds = torch.cat([prompt_embeds] * 2)
+                pooled_prompt_embeds = torch.cat([pooled_prompt_embeds] * 2) 
+                
+            if guidance_mode not in ['seg']:
                 if negative_prompt == None:
                     negative_prompt = ['']
                 elif isinstance(negative_prompt, str):
@@ -366,9 +374,10 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFileMixin):
                     num_images_per_prompt=num_images_per_prompt,
                     max_sequence_length=max_sequence_length,
                     device=device,
-                )
+                )   
                 pooled_prompt_embeds = torch.cat([pooled_prompt_embeds, uncond_pooled_prompt_embeds])
                 prompt_embeds = torch.cat([prompt_embeds, uncond_prompt_embeds])
+            print('prompt embeds', prompt_embeds, prompt_embeds.shape)
 
         if self.text_encoder is not None:
             if isinstance(self, FluxLoraLoaderMixin) and USE_PEFT_BACKEND:
@@ -398,9 +407,9 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFileMixin):
         guidance_mode=None
     ):  
         if guidance_mode is not None:
-            if guidance_mode not in ['cfg', 'apg', 'cfgpp', 'seg', 'apg-sample']:
+            if guidance_mode not in ['cfg', 'apg', 'cfgpp', 'seg', 'cfg+seg', 'apg-sample']:
                 raise ValueError(
-                f"guidance_mode should be one of ['cfg', 'apg', 'cfgpp', 'seg', 'apg-sample'] but got {guidance_mode}"
+                f"guidance_mode should be one of ['cfg', 'apg', 'cfgpp', 'seg', 'cfg+seg' 'apg-sample'] but got {guidance_mode}"
             )
         if height % 8 != 0 or width % 8 != 0:
             raise ValueError(f"`height` and `width` have to be divisible by 8 but are {height} and {width}.")
@@ -704,7 +713,8 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFileMixin):
             num_images_per_prompt=num_images_per_prompt,
             max_sequence_length=max_sequence_length,
             lora_scale=lora_scale,
-            do_classifier_free_guidance=True if guidance_mode else False
+            do_classifier_free_guidance=True if guidance_mode else False,
+            guidance_mode=guidance_mode
         )
 
         # 4. Prepare latent variables
@@ -758,8 +768,10 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFileMixin):
                 if self.interrupt:
                     continue
 
-                if guidance_mode in ['cfg', 'cfgpp', 'apg', 'seg']:
+                if guidance_mode in ['cfg', 'cfgpp', 'apg', 'seg', 'apg-sample']:
                     latent_model_input = torch.cat([latents] * 2)
+                elif guidance_mode in ['cfg+seg']:
+                    latent_model_input = torch.cat([latents] * 3)
                 else:
                     latent_model_input = latents
 
@@ -794,16 +806,25 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFileMixin):
                     noise_pred_text, noise_pred_uncond = noise_pred.chunk(2)
                     noise_pred = noise_pred_uncond + guidance_weight * (noise_pred_text - noise_pred_uncond)
                 elif guidance_mode == 'seg':
-                    noise_pred_text, noise_pred_uncond_ptb = noise_pred.chunk(2)
-                    noise_pred = noise_pred_uncond_ptb + seg_guidance_weight * (noise_pred_text - noise_pred_uncond_ptb)
+                    noise_pred_text, noise_pred_text_ptb = noise_pred.chunk(2)
+                    noise_pred = noise_pred_text_ptb + seg_guidance_weight * (noise_pred_text - noise_pred_text_ptb)
+                elif guidance_mode == 'cfg+seg':
+                    noise_pred_text, noise_pred_text_ptb, noise_pred_uncond  = noise_pred.chunk(3)
+                    noise_pred = noise_pred_text + (guidance_weight-1.0) * (noise_pred_text - noise_pred_uncond) + seg_guidance_weight * (noise_pred_text - noise_pred_text_ptb)
                 elif guidance_mode == 'apg':
                     noise_pred_text, noise_pred_uncond = noise_pred.chunk(2)
-                    self.debug_msg(f'apg shape {noise_pred.shape}, {noise_pred_text.shape}')
                     noise_pred = apg_normalized_guidance(noise_pred_text, noise_pred_uncond, guidance_weight, momentum_buffer, eta=apg_eta, norm_threshold=apg_r)
+                elif guidance_mode == 'apg-sample':
+                    noise_pred_text, noise_pred_uncond = noise_pred.chunk(2)
+                    latents_pred_text = self.scheduler.step(noise_pred_text, t, latents, return_dict=False)[0]
+                    self.scheduler._step_index -= 1
+                    latents_pred_uncond = self.scheduler.step(noise_pred_uncond, t, latents, return_dict=False)[0]
+                    latents = apg_normalized_guidance(latents_pred_text, latents_pred_uncond, guidance_weight, momentum_buffer, eta=apg_eta, norm_threshold=apg_r)
 
-                # compute the previous noisy sample x_t -> x_t-1
                 latents_dtype = latents.dtype
-                latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+                if guidance_mode != 'apg-sample':
+                # compute the previous noisy sample x_t -> x_t-1
+                    latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
 
                 if latents.dtype != latents_dtype:
                     if torch.backends.mps.is_available():
