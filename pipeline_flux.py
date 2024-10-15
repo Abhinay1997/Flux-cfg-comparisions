@@ -734,7 +734,7 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFileMixin):
         # 5. Prepare timesteps
         sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
         if sway_sampling_coeff is not None:
-            sigmas = sigmas + sway_sampling_coef * (torch.cos(torch.pi / 2 * sigmas) - 1 + sigmas)
+            sigmas = sigmas + sway_sampling_coeff * (np.cos(np.pi / 2 * sigmas) - 1 + sigmas)
             print(sigmas)
         image_seq_len = latents.shape[1]
         mu = calculate_shift(
