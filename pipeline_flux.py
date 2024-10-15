@@ -595,7 +595,8 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFileMixin):
         apg_r = 2.5,
         seg_blur_sigma = 1.0,
         seg_inf_blur_threshold = 9999.0,
-        seg_guidance_weight = None
+        seg_guidance_weight = None,
+        sway_sampling_coeff = None # s ∈ [−1, 2/(π−2)]
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -732,6 +733,9 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFileMixin):
 
         # 5. Prepare timesteps
         sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
+        if sway_sampling_coeff is not None:
+            sigmas = sigmas + sway_sampling_coef * (torch.cos(torch.pi / 2 * sigmas) - 1 + sigmas)
+            print(sigmas)
         image_seq_len = latents.shape[1]
         mu = calculate_shift(
             image_seq_len,
