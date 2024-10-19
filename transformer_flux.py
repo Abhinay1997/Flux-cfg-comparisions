@@ -99,7 +99,7 @@ class CustomFluxAttnProcessor2_0:
                 query = query[:,:,512:,:]
             query_org, query_ptb = query.chunk(2)
             query_ptb = query_ptb.permute(0, 1, 3, 2).view(batch_size//2, attn.heads * head_dim, height, width)
-            
+
             if not (seg_blur_sigma > seg_inf_blur_threshold):
                 kernel_size = math.ceil(6 * seg_blur_sigma) + 1 - math.ceil(6 * seg_blur_sigma) % 2
                 query_ptb = gaussian_blur_2d(query_ptb, kernel_size, seg_blur_sigma)
@@ -170,6 +170,15 @@ class CustomFluxAttnProcessor2_0:
             key = apply_rotary_emb(key, image_rotary_emb)
 
         hidden_states = F.scaled_dot_product_attention(query, key, value, dropout_p=0.0, is_causal=False)
+        if apply_query_level_guidance and guidance_mode == 'pag':
+            hidden_states_org, hidden_states_ptb = hidden_states.chunk(2)
+            value_org, value_ptb = value.chunk(2)
+            hidden_states = torch.cat([hidden_states_org, value_ptb])
+        elif apply_query_level_guidance and guidance_mode == 'cfg+pag':
+            hidden_states_org, hidden_states_ptb, hidden_states_uncond = hidden_states.chunk(3)
+            value_org, value_ptb, value_uncond = value.chunk(3)
+            hidden_states = torch.cat([hidden_states_org, value_ptb, hidden_states_uncond])
+            
         hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
         hidden_states = hidden_states.to(query.dtype)
 
@@ -178,7 +187,6 @@ class CustomFluxAttnProcessor2_0:
                 hidden_states[:, : encoder_hidden_states.shape[1]],
                 hidden_states[:, encoder_hidden_states.shape[1] :],
             )
-
             # linear proj
             hidden_states = attn.to_out[0](hidden_states)
             # dropout

@@ -351,14 +351,14 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFileMixin):
                 max_sequence_length=max_sequence_length,
                 device=device,
             )
-            #seg => [text, text]
-            #cfg+seg => [text, text, null]
+            #seg or pag => [text, text]
+            #cfg+seg or cfg+pag=> [text, text, null]
             #cfg => [text, null]
-            if guidance_mode in ['seg', 'cfg+seg']:
+            if guidance_mode in ['seg', 'cfg+seg', 'pag', 'cfg+pag']:
                 prompt_embeds = torch.cat([prompt_embeds] * 2)
                 pooled_prompt_embeds = torch.cat([pooled_prompt_embeds] * 2) 
                 
-            if guidance_mode not in ['seg']:
+            if guidance_mode not in ['seg', 'pag']:
                 if negative_prompt == None:
                     negative_prompt = ['']
                 elif isinstance(negative_prompt, str):
@@ -618,17 +618,7 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFileMixin):
         max_sequence_length: int = 512,
         compile=False,
         debug=False,
-        # guidance_mode = None, #one of cfg, cfgpp, seg, apg, apg-sample
-        # guidance_weight = 0.0,
-        # apg_eta = 0.0,
-        # apg_momentum = -0.75,
-        # apg_r = 2.5,
-        seg_blur_sigma = 1.0,
-        seg_inf_blur_threshold = 9999.0,
-        seg_guidance_weight = None,
-        skip_transformer_blocks = [], #for seg, pag etc..
-        skip_single_transformer_blocks = [], #for seg, pag etc..
-        sway_sampling_coeff = None, # s ∈ [−1, 2/(π−2)]
+        sway_sampling_coeff=0,
         guidance_kwargs = None
     ):
         r"""
@@ -707,6 +697,7 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFileMixin):
         guidance_mode = guidance_kwargs.get('guidance_mode', None)
         guidance_weight = guidance_kwargs.get('guidance_weight', 0.0)
         seg_guidance_weight = guidance_kwargs.get('seg_guidance_weight', 0.0)
+        pag_guidance_weight = guidance_kwargs.get('pag_guidance_weight', 0.0)
         apg_momentum = guidance_kwargs.get('apg_momentum', -0.75)
         
 
@@ -871,9 +862,11 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFileMixin):
                     latents_pred_uncond = self.scheduler.step(noise_pred_uncond, t, latents, return_dict=False)[0]
                     latents = apg_normalized_guidance(latents_pred_text, latents_pred_uncond, guidance_weight, momentum_buffer, eta=apg_eta, norm_threshold=apg_r)
                 elif guidance_mode == 'pag':
-                    pass
+                    noise_pred_text, noise_pred_text_ptb = noise_pred.chunk(2)
+                    noise_pred = noise_pred_text_ptb + pag_guidance_weight * (noise_pred_text - noise_pred_text_ptb)
                 elif guidance_mode == 'cfg+pag':
-                    pass
+                    noise_pred_text, noise_pred_ptb, noise_pred_uncond = noise_pred.chunk(3)
+                    noise_pred = noise_pred_uncond + guidance_weight * (noise_pred_text - noise_pred_uncond) + pag_guidance_weight * (noise_pred_text - noise_pred_ptb)
 
                 latents_dtype = latents.dtype
                 if guidance_mode != 'apg-sample':
