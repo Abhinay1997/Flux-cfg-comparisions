@@ -64,7 +64,6 @@ EXAMPLE_DOC_STRING = """
         ```
 """
 
-
 def calculate_shift(
     image_seq_len,
     base_seq_len: int = 256,
@@ -377,7 +376,6 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFileMixin):
                 )   
                 pooled_prompt_embeds = torch.cat([pooled_prompt_embeds, uncond_pooled_prompt_embeds])
                 prompt_embeds = torch.cat([prompt_embeds, uncond_prompt_embeds])
-            print('prompt embeds', prompt_embeds, prompt_embeds.shape)
 
         if self.text_encoder is not None:
             if isinstance(self, FluxLoraLoaderMixin) and USE_PEFT_BACKEND:
@@ -394,6 +392,42 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFileMixin):
         self.debug_msg(f'text_ids {text_ids.shape}')
         return prompt_embeds, pooled_prompt_embeds, text_ids
 
+    def check_guidance_kwargs(self, guidance_kwargs):
+        import warnings
+        allowed_guidance_modes = ['apg', 'apg-sample', 'cfg', 'cfgpp', 'cfg+pag', 'cfg+seg', 'pag', 'seg']
+        
+        if len(guidance_kwargs) > 0 and 'guidance_mode' not in guidance_kwargs:
+            raise ValueError(f'guidance_mode not passed in guidance_kwargs')
+
+        ## No guidance. Use the guidance embedding
+        if len(guidance_kwargs) == 0:
+            return
+
+        guidance_mode = guidance_kwargs['guidance_mode']
+
+        ## If guidance mode is None but other kwargs are present, they will be useless
+        if guidance_mode == None and len(guidance_kwargs) > 1:
+            warnings.warn('guidance_mode is None, all guidance_kwargs passed will be ignored.')
+
+        ## If guidance mode is not one of expected values.
+        if guidance_mode not in allowed_guidance_modes:
+            raise ValueError(f'Expected guidance_mode to be one of {allowed_guidance_modes} but got {guidance_mode}')
+
+        ## If guidance mode is not seg, 
+        if 'seg' in guidance_mode:
+            if 'guidance_weight' in guidance_kwargs and guidance_mode != 'cfg+seg':
+                warnings.warn(f'guidance_weight will have no effect for seg. Use seg_guidance_weight instead')
+            if 'seg_guidance_weight' not in guidance_kwargs:
+                raise ValueError(f'seg_guidance_weight is required in guidance_kwargs to use guidance_mode "seg"')
+
+        if 'pag' in guidance_mode:
+            if 'guidance_weight' in guidance_kwargs and guidance_mode != 'cfg+pag':
+                warnings.warn(f'guidance_weight will have no effect for seg. Use pag_guidance_weight instead')
+            if 'pag_guidance_weight' not in guidance_kwargs:
+                raise ValueError(f'pag_guidance_weight is required in guidance_kwargs to use guidance_mode "pag"')
+        
+         
+
     def check_inputs(
         self,
         prompt,
@@ -404,13 +438,9 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFileMixin):
         pooled_prompt_embeds=None,
         callback_on_step_end_tensor_inputs=None,
         max_sequence_length=None,
-        guidance_mode=None
+        guidance_kwargs=None
     ):  
-        if guidance_mode is not None:
-            if guidance_mode not in ['cfg', 'apg', 'cfgpp', 'seg', 'cfg+seg', 'apg-sample']:
-                raise ValueError(
-                f"guidance_mode should be one of ['cfg', 'apg', 'cfgpp', 'seg', 'cfg+seg' 'apg-sample'] but got {guidance_mode}"
-            )
+        self.check_guidance_kwargs(guidance_kwargs)
         if height % 8 != 0 or width % 8 != 0:
             raise ValueError(f"`height` and `width` have to be divisible by 8 but are {height} and {width}.")
 
@@ -588,15 +618,18 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFileMixin):
         max_sequence_length: int = 512,
         compile=False,
         debug=False,
-        guidance_mode = None, #one of cfg, cfgpp, seg, apg, apg-sample
-        guidance_weight = 0.0,
-        apg_eta = 0.0,
-        apg_momentum = -0.75,
-        apg_r = 2.5,
+        # guidance_mode = None, #one of cfg, cfgpp, seg, apg, apg-sample
+        # guidance_weight = 0.0,
+        # apg_eta = 0.0,
+        # apg_momentum = -0.75,
+        # apg_r = 2.5,
         seg_blur_sigma = 1.0,
         seg_inf_blur_threshold = 9999.0,
         seg_guidance_weight = None,
-        sway_sampling_coeff = None # s ∈ [−1, 2/(π−2)]
+        skip_transformer_blocks = [], #for seg, pag etc..
+        skip_single_transformer_blocks = [], #for seg, pag etc..
+        sway_sampling_coeff = None, # s ∈ [−1, 2/(π−2)]
+        guidance_kwargs = None
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -671,6 +704,12 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFileMixin):
         height = height or self.default_sample_size * self.vae_scale_factor
         width = width or self.default_sample_size * self.vae_scale_factor
 
+        guidance_mode = guidance_kwargs.get('guidance_mode', None)
+        guidance_weight = guidance_kwargs.get('guidance_weight', 0.0)
+        seg_guidance_weight = guidance_kwargs.get('seg_guidance_weight', 0.0)
+        apg_momentum = guidance_kwargs.get('apg_momentum', -0.75)
+        
+
         # 1. Check inputs. Raise error if not correct
         self.check_inputs(
             prompt,
@@ -681,7 +720,7 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFileMixin):
             pooled_prompt_embeds=pooled_prompt_embeds,
             callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
             max_sequence_length=max_sequence_length,
-            guidance_mode=guidance_mode
+            guidance_kwargs=guidance_kwargs
         )
 
         self._guidance_scale = guidance_scale
@@ -730,12 +769,14 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFileMixin):
             generator,
             latents,
         )
+        guidance_kwargs['height'] = (int(height) // self.vae_scale_factor)
+        guidance_kwargs['width'] = (int(width) // self.vae_scale_factor)
 
         # 5. Prepare timesteps
         sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
         if sway_sampling_coeff is not None:
             sigmas = sigmas + sway_sampling_coeff * (np.cos(np.pi / 2 * sigmas) - 1 + sigmas)
-            print(sigmas)
+
         image_seq_len = latents.shape[1]
         mu = calculate_shift(
             image_seq_len,
@@ -763,15 +804,15 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFileMixin):
             guidance = None
 
         momentum_buffer = MomentumBuffer(momentum=apg_momentum) if guidance_mode == 'apg' else None
-        self.joint_attention_kwargs['guidance_mode'] = guidance_mode
-        self.joint_attention_kwargs['seg_blur_sigma'] = seg_blur_sigma
-        self.joint_attention_kwargs['seg_inf_blur_threshold'] = seg_inf_blur_threshold
+        # self.joint_attention_kwargs['guidance_mode'] = guidance_mode
+        # self.joint_attention_kwargs['seg_blur_sigma'] = seg_blur_sigma
+        # self.joint_attention_kwargs['seg_inf_blur_threshold'] = seg_inf_blur_threshold
         # 6. Denoising loop
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 if self.interrupt:
                     continue
-
+                    
                 if guidance_mode in ['cfg', 'cfgpp', 'apg', 'seg', 'apg-sample']:
                     latent_model_input = torch.cat([latents] * 2)
                 elif guidance_mode in ['cfg+seg']:
@@ -798,6 +839,7 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFileMixin):
                     txt_ids=text_ids,
                     img_ids=latent_image_ids,
                     joint_attention_kwargs=self.joint_attention_kwargs,
+                    guidance_kwargs=guidance_kwargs,
                     return_dict=False,
                 )[0]
                 self.debug_msg(f'guidance_mode is {guidance_mode}. noise_pred shape is {noise_pred.shape}')
@@ -816,14 +858,22 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFileMixin):
                     noise_pred_text, noise_pred_text_ptb, noise_pred_uncond  = noise_pred.chunk(3)
                     noise_pred = noise_pred_text + (guidance_weight-1.0) * (noise_pred_text - noise_pred_uncond) + seg_guidance_weight * (noise_pred_text - noise_pred_text_ptb)
                 elif guidance_mode == 'apg':
+                    apg_eta = guidance_kwargs.get('apg_eta')
+                    apg_r = guidance_kwargs.get('apg_r')
                     noise_pred_text, noise_pred_uncond = noise_pred.chunk(2)
                     noise_pred = apg_normalized_guidance(noise_pred_text, noise_pred_uncond, guidance_weight, momentum_buffer, eta=apg_eta, norm_threshold=apg_r)
                 elif guidance_mode == 'apg-sample':
+                    apg_eta = guidance_kwargs.get('apg_eta')
+                    apg_r = guidance_kwargs.get('apg_r')
                     noise_pred_text, noise_pred_uncond = noise_pred.chunk(2)
                     latents_pred_text = self.scheduler.step(noise_pred_text, t, latents, return_dict=False)[0]
                     self.scheduler._step_index -= 1
                     latents_pred_uncond = self.scheduler.step(noise_pred_uncond, t, latents, return_dict=False)[0]
                     latents = apg_normalized_guidance(latents_pred_text, latents_pred_uncond, guidance_weight, momentum_buffer, eta=apg_eta, norm_threshold=apg_r)
+                elif guidance_mode == 'pag':
+                    pass
+                elif guidance_mode == 'cfg+pag':
+                    pass
 
                 latents_dtype = latents.dtype
                 if guidance_mode != 'apg-sample':

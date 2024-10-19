@@ -75,12 +75,12 @@ class CustomFluxAttnProcessor2_0:
         seg_blur_sigma=1.0,
         guidance_mode=None,
         seg_inf_blur_threshold=9999.0,
+        apply_query_level_guidance=False, #whether to skip guidance for seg, pag.
+        height = None,
+        width=None
     ) -> torch.FloatTensor:
         batch_size, _, _ = hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
 
-        # print('guidance_mode, seg params', guidance_mode, seg_blur_sigma, seg_inf_blur_threshold)
-        # print('hidden states', hidden_states.shape)
-        # `sample` projections.
         query = attn.to_q(hidden_states)
         key = attn.to_k(hidden_states)
         value = attn.to_v(hidden_states)
@@ -93,8 +93,10 @@ class CustomFluxAttnProcessor2_0:
         value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
 
         ## TODO: chunk into 2 or 3 parts depending on just seg or cfg+seg
-        if guidance_mode == "seg":
-            height = width = math.isqrt(query.shape[2])
+        if apply_query_level_guidance and guidance_mode == "seg":
+            if encoder_hidden_states is None:
+                query_enc_hid_states = query[:,:,:512,:]
+                query = query[:,:,512:,:]
             query_org, query_ptb = query.chunk(2)
             query_ptb = query_ptb.permute(0, 1, 3, 2).view(batch_size//2, attn.heads * head_dim, height, width)
             
@@ -102,14 +104,18 @@ class CustomFluxAttnProcessor2_0:
                 kernel_size = math.ceil(6 * seg_blur_sigma) + 1 - math.ceil(6 * seg_blur_sigma) % 2
                 query_ptb = gaussian_blur_2d(query_ptb, kernel_size, seg_blur_sigma)
             else:
-                print('inf threshold shape', query_ptb.mean(dim=(-2, -1), keepdim=True).shape)
                 query_ptb[:] = query_ptb.mean(dim=(-2, -1), keepdim=True)
 
             query_ptb = query_ptb.view(batch_size//2, attn.heads, head_dim, height*width).permute(0,1,3,2)
             query = torch.cat((query_org, query_ptb), dim=0)
+            if encoder_hidden_states is None:
+                query = torch.cat([query_enc_hid_states, query], dim=2)
 
-        if guidance_mode == "cfg+seg":
-            height = width = math.isqrt(query.shape[2])
+
+        if apply_query_level_guidance and guidance_mode == "cfg+seg":
+            if encoder_hidden_states is None:
+                query_enc_hid_states = query[:,:,:512,:]
+                query = query[:,:,512:,:]
             query_org, query_ptb, query_uncond = query.chunk(3)
             query_ptb = query_ptb.permute(0, 1, 3, 2).view(batch_size//3, attn.heads * head_dim, height, width)
             
@@ -117,12 +123,13 @@ class CustomFluxAttnProcessor2_0:
                 kernel_size = math.ceil(6 * seg_blur_sigma) + 1 - math.ceil(6 * seg_blur_sigma) % 2
                 query_ptb = gaussian_blur_2d(query_ptb, kernel_size, seg_blur_sigma)
             else:
-                print('inf threshold shape', query_ptb.mean(dim=(-2, -1), keepdim=True).shape)
                 query_ptb[:] = query_ptb.mean(dim=(-2, -1), keepdim=True)
 
             query_ptb = query_ptb.view(batch_size//3, attn.heads, head_dim, height*width).permute(0,1,3,2)
             query = torch.cat((query_org, query_ptb, query_uncond), dim=0)
-            
+            if encoder_hidden_states is None:
+                query = torch.cat([query_enc_hid_states, query], dim=2)
+
             
         if attn.norm_q is not None:
             query = attn.norm_q(query)
@@ -225,6 +232,7 @@ class FluxSingleTransformerBlock(nn.Module):
         hidden_states: torch.FloatTensor,
         temb: torch.FloatTensor,
         image_rotary_emb=None,
+        guidance_kwargs=None
     ):
         residual = hidden_states
         norm_hidden_states, gate = self.norm(hidden_states, emb=temb)
@@ -233,6 +241,7 @@ class FluxSingleTransformerBlock(nn.Module):
         attn_output = self.attn(
             hidden_states=norm_hidden_states,
             image_rotary_emb=image_rotary_emb,
+            **guidance_kwargs
         )
 
         hidden_states = torch.cat([attn_output, mlp_hidden_states], dim=2)
@@ -303,7 +312,8 @@ class FluxTransformerBlock(nn.Module):
         encoder_hidden_states: torch.FloatTensor,
         temb: torch.FloatTensor,
         image_rotary_emb=None,
-        joint_attention_kwargs=None
+        joint_attention_kwargs=None,
+        guidance_kwargs=None
     ):
         norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm1(hidden_states, emb=temb)
 
@@ -316,7 +326,8 @@ class FluxTransformerBlock(nn.Module):
             hidden_states=norm_hidden_states,
             encoder_hidden_states=norm_encoder_hidden_states,
             image_rotary_emb=image_rotary_emb,
-            **joint_attention_kwargs
+            **joint_attention_kwargs,
+            **guidance_kwargs
         )
 
         # Process attention outputs for the `hidden_states`.
@@ -542,6 +553,7 @@ class FluxTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrig
         controlnet_block_samples=None,
         controlnet_single_block_samples=None,
         return_dict: bool = True,
+        guidance_kwargs=None
     ) -> Union[torch.FloatTensor, Transformer2DModelOutput]:
         """
         The [`FluxTransformer2DModel`] forward method.
@@ -636,12 +648,14 @@ class FluxTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrig
                 )
 
             else:
+                guidance_kwargs['apply_query_level_guidance'] = index_block in guidance_kwargs.get('apply_transformer_blocks', [])
                 encoder_hidden_states, hidden_states = block(
                     hidden_states=hidden_states,
                     encoder_hidden_states=encoder_hidden_states,
                     temb=temb,
                     image_rotary_emb=image_rotary_emb,
-                    joint_attention_kwargs=joint_attention_kwargs
+                    joint_attention_kwargs=joint_attention_kwargs,
+                    guidance_kwargs=guidance_kwargs
                 )
 
             # controlnet residual
@@ -674,10 +688,12 @@ class FluxTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrig
                 )
 
             else:
+                guidance_kwargs['apply_query_level_guidance'] = index_block in guidance_kwargs.get('apply_single_transformer_blocks', [])
                 hidden_states = block(
                     hidden_states=hidden_states,
                     temb=temb,
                     image_rotary_emb=image_rotary_emb,
+                    guidance_kwargs=guidance_kwargs
                 )
 
             # controlnet residual
