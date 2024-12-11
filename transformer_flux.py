@@ -77,7 +77,8 @@ class CustomFluxAttnProcessor2_0:
         seg_inf_blur_threshold=9999.0,
         apply_query_level_guidance=False, #whether to skip guidance for seg, pag.
         height = None,
-        width=None
+        width=None,
+        zip_weight=None,
     ) -> torch.FloatTensor:
         batch_size, _, _ = hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
 
@@ -169,7 +170,21 @@ class CustomFluxAttnProcessor2_0:
             query = apply_rotary_emb(query, image_rotary_emb)
             key = apply_rotary_emb(key, image_rotary_emb)
 
+        if apply_query_level_guidance and guidance_mode == 'zip':
+            attn_mask = torch.zeros(query.shape[0], query.shape[-2], key.shape[-2])
+            #mask shape = bs * 2, l, s
+            attn_mask = attn_mask + float('-inf')
+            attn_mask = attn_mask.fill_diagonal_(0)
+        else:
+            attn_mask = None
+            
         hidden_states = F.scaled_dot_product_attention(query, key, value, dropout_p=0.0, is_causal=False)
+
+        if apply_query_level_guidance and guidance_mode == 'zip':
+            hidden_states_ptb = F.scaled_dot_product_attention(query, key, value, dropout_p=0.0, is_causal=False, attn_mask=attn_mask)
+            hidden_states = hidden_states_ptb + zip_weight * (hidden_states - hidden_states_ptb)
+            print('query level attn')
+
         if apply_query_level_guidance and guidance_mode == 'pag':
             hidden_states_org, hidden_states_ptb = hidden_states.chunk(2)
             value_org, value_ptb = value.chunk(2)
