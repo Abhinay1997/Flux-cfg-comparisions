@@ -794,7 +794,7 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFileMixin):
         else:
             guidance = None
 
-        momentum_buffer = MomentumBuffer(momentum=apg_momentum) if guidance_mode == 'apg' else None
+        momentum_buffer = MomentumBuffer(momentum=apg_momentum) if guidance_mode in ['apg', 'apg-sample'] else None
         # self.joint_attention_kwargs['guidance_mode'] = guidance_mode
         # self.joint_attention_kwargs['seg_blur_sigma'] = seg_blur_sigma
         # self.joint_attention_kwargs['seg_inf_blur_threshold'] = seg_inf_blur_threshold
